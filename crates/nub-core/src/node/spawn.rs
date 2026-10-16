@@ -1567,14 +1567,14 @@ pub fn spawn_node(config: &SpawnConfig<'_>) -> Result<SpawnResult> {
         cmd.env(super::gc::STARTUP_ENV, startup_arg);
     }
 
-    // Compat is tree-wide, not only a choice made by this one launcher. The
-    // restored PATH deliberately preserves unrelated inherited entries, which
-    // may include a Nub shim from an outer logical invocation. Stamping the
-    // public opt-out makes any later bare `node` descendant stay vanilla even
-    // if it reaches that shim. Apply it after env-file values so `--node` or a
-    // resolved `nodeCompat` cannot be undone by forwarded project input.
+    // Compat covers the bare `node` descendants of this launch, not only the
+    // one process. The restored PATH deliberately preserves unrelated inherited
+    // entries, which may include a Nub shim from an outer logical invocation;
+    // the marker keeps a `node` that reaches it vanilla. Set after
+    // `restore_compat_environment`, which clears an inherited copy, and after
+    // env-file values, which must not undo `--node` or a resolved `nodeCompat`.
     if config.compat_mode {
-        cmd.env("NODE_COMPAT", "1");
+        cmd.env(COMPAT_LAUNCH_ENV, "1");
     }
 
     // User args always pass through.
@@ -2520,6 +2520,26 @@ pub const RUNTIME_CONFIG_ENV: &str = "__NUB_RUNTIME_CONFIG";
 /// boundary.
 const FORCE_ASYNC_TIER_ENV: &str = "__NUB_FORCE_ASYNC_TIER";
 
+/// Carries a compat launch to the bare `node` descendants that continue it. A
+/// compat child keeps whatever PATH it inherited, which can still hold a Nub
+/// shim from an outer invocation; a `node` that lands there reads this and stays
+/// vanilla ([`inherits_compat_launch`]).
+///
+/// Deliberately NOT the public `NODE_COMPAT`. That variable is the user's
+/// tree-wide opt-out and every Nub entry point honors it, so stamping it made a
+/// compat launch the user never asked to persist (a plain `node` through the
+/// persistent shim, a `--node` run) switch off a later `nub file.ts` in the same
+/// tree. This marker is read on the `node` continuation path only and is dropped
+/// at the fresh-invocation boundary with the rest of the parent's state.
+pub const COMPAT_LAUNCH_ENV: &str = "__NUB_NODE_COMPAT";
+
+/// Whether this process descends from a compat launch that no fresh Nub
+/// invocation has superseded. Meaningful only on the `node` shim path: every
+/// other entry point clears [`COMPAT_LAUNCH_ENV`] before reading anything.
+pub fn inherits_compat_launch() -> bool {
+    env::var_os(COMPAT_LAUNCH_ENV).is_some_and(|value| value == "1")
+}
+
 /// The presence bitmask stamped alongside the `__NUB_COMPAT_*` capture, so a
 /// variable captured EMPTY stays distinguishable from one that was absent.
 const COMPAT_PRESENT_ENV: &str = "__NUB_COMPAT_PRESENT";
@@ -2988,6 +3008,7 @@ fn augmentation_environment_restoration() -> Vec<(&'static str, Option<OsString>
 
     for marker in [
         COMPAT_PRESENT_ENV,
+        COMPAT_LAUNCH_ENV,
         RUNTIME_CONFIG_ENV,
         VERSION_ENV,
         flags::NEUTRALIZE_LOCALSTORAGE_ENV,
@@ -3948,13 +3969,10 @@ const REAP_LEGACY_ENTRY_CAP: usize = 256;
 /// a directory scan + per-entry `stat`, which is exactly the synchronous cost the
 /// latency-sensitive run path must not pay. Drive it ONLY off the thread via
 /// [`spawn_stale_shim_reaper`], which detaches it so the run never waits on it.
-fn reap_stale_shims() {
-    reap_stale_shims_in(&env::temp_dir(), std::process::id(), pid_is_alive);
-}
-
-/// Core of [`reap_stale_shims`], parameterized over the temp dir, this process's
-/// pid, and a pid-liveness probe so it is unit-testable without touching the
-/// shared global temp dir or real process state.
+///
+/// Parameterized over the temp dir, this process's pid, and a pid-liveness
+/// probe so it is unit-testable without touching the shared global temp dir or
+/// real process state.
 fn reap_stale_shims_in(temp: &Path, self_pid: u32, is_alive: impl Fn(u32) -> bool) {
     let Ok(entries) = fs::read_dir(temp) else {
         return;
@@ -4038,14 +4056,21 @@ fn parse_shim_dir_name(name: &str) -> Option<(u32, ShimDirNameKind)> {
     (pid != 0).then_some((pid, kind))
 }
 
-/// Spawn [`reap_stale_shims`] on a DETACHED background thread so the sweep's
+/// Spawn [`reap_stale_shims_in`] on a DETACHED background thread so the sweep's
 /// directory scan never adds latency to the run/spawn/teardown path. Fire and
 /// forget: if the process exits before the sweep finishes, any not-yet-reaped
 /// stale dirs are collected by a later run. Call once, early.
+///
+/// The temp dir is resolved HERE, on the calling thread. With `TMPDIR` unset
+/// macOS answers `temp_dir` through `confstr`, whose first call initializes
+/// libSystem's notify state. Run on the reaper thread, that raced the launch
+/// thread's `fork` for the Node child: the child inherited the half-initialized
+/// state, aborted in `_notify_fork_child` before `exec`, and the run exited 137.
 pub fn spawn_stale_shim_reaper() {
+    let temp = env::temp_dir();
     let _ = std::thread::Builder::new()
         .name("nub-shim-reaper".into())
-        .spawn(reap_stale_shims);
+        .spawn(move || reap_stale_shims_in(&temp, std::process::id(), pid_is_alive));
 }
 
 /// Is `pid` a currently-live process? Used by the shim reaper to avoid reaping a
