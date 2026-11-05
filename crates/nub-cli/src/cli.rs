@@ -723,7 +723,10 @@ impl Argv0 {
 /// argv0 is a fresh user invocation and gets the parent's captured ambient
 /// environment back. A hidden internal re-entry belongs to its parent and is
 /// exempt for the same reason `node` is.
-pub fn normalize_invocation_environment() {
+///
+/// Every other process also counts itself into nub's recursion bound here, and
+/// fails when it is one nub too many ([`nub_core::node::nesting`]).
+pub fn normalize_invocation_environment() -> Result<()> {
     // UNCONDITIONALLY FIRST, before the early returns below: this both establishes the
     // verb every later `Argv0::detect()` sees and erases `__NUB_ARGV0` so no child
     // inherits it. Gating it behind the returns would leak the variable into the whole
@@ -737,8 +740,21 @@ pub fn normalize_invocation_environment() {
     let internal_reentry = env::args_os().nth(1).is_some_and(|arg| {
         (cfg!(unix) && arg == "__pdeath-watch") || arg == "__node-gyp-bootstrap"
     });
-    if internal_reentry || matches!(Argv0::detect(), Argv0::Node) {
-        return;
+    if internal_reentry {
+        return Ok(());
+    }
+    // The env-selected watcher form (see `run`) is a re-entry too, and must not
+    // refuse at the bound: the nub that started it already passed.
+    let env_watcher = cfg!(unix)
+        && env::var_os("__NUB_COMPILED_LAUNCHER_MODE").is_some_and(|mode| mode == "pdeath-watch")
+        && env::args_os().len() == 3;
+    if !env_watcher {
+        // SAFETY: `main` calls this before logging, config initialization, or any
+        // thread-capable Nub subsystem. No other thread exists yet.
+        unsafe { nub_core::node::nesting::enter() }?;
+    }
+    if matches!(Argv0::detect(), Argv0::Node) {
+        return Ok(());
     }
 
     // SAFETY: `main` calls this before logging, config initialization, or any
@@ -746,6 +762,7 @@ pub fn normalize_invocation_environment() {
     unsafe {
         nub_core::node::spawn::restore_fresh_invocation_environment();
     }
+    Ok(())
 }
 
 /// Nub — TypeScript-first developer supertool.
@@ -4260,37 +4277,6 @@ fn tsconfig_reported_env() -> Option<(String, String)> {
     (!reported.is_empty()).then(|| (nub_tsconfig::REPORTED_ENV.to_string(), reported.join("\n")))
 }
 
-/// Where the entry script sits in a Node command line: the first argument that is
-/// neither a flag nor the separate value of one.
-///
-/// Lists only the preload and resolution options, which are what precede an entry
-/// in practice, rather than all of Node's value flags. A flag missing from the list
-/// has its value read as the entry, so a caller must degrade safely on a wrong
-/// answer. Node treats `_` and `-` as the same character in an option name.
-pub(crate) fn node_entry_index(args: &[String]) -> Option<usize> {
-    const VALUE_FLAGS: [&str; 7] = [
-        "-r",
-        "--require",
-        "--import",
-        "--loader",
-        "--experimental-loader",
-        "-C",
-        "--conditions",
-    ];
-    let mut at = 0;
-    while let Some(arg) = args.get(at) {
-        if !arg.starts_with('-') {
-            return Some(at);
-        }
-        at += if VALUE_FLAGS.contains(&arg.replace('_', "-").as_str()) {
-            2
-        } else {
-            1
-        };
-    }
-    None
-}
-
 /// The directory whose tsconfig governs the entry of a `nub <file>` run, resolved
 /// against `cwd`. With no entry (a bare `--flag`) this is `None` and the
 /// CWD-anchored check stands alone.
@@ -4305,7 +4291,7 @@ pub(crate) fn node_entry_index(args: &[String]) -> Option<usize> {
 /// often extending a file that was never published — governs nothing and is
 /// skipped outright rather than warned about.
 fn entry_tsconfig_dir(args: &[String], cwd: &Path, node_options: &[String]) -> Option<PathBuf> {
-    let at = node_entry_index(args)?;
+    let at = nub_core::node::argv::entry_index(args)?;
     let joined = cwd.join(&args[at]);
     let real = std::fs::canonicalize(&joined)
         .map(|p| PathBuf::from(strip_windows_verbatim_prefix(&p.to_string_lossy())))
@@ -7541,8 +7527,6 @@ fn run_watch(file: &str, args: &[String]) -> Result<i32> {
     }
     if spawns_node {
         nub_core::node::discovery::mark_node_launch(&mut cmd, node.path.as_std_path());
-    } else {
-        nub_core::node::discovery::unmark_node_launch(&mut cmd);
     }
     cmd.args(&node_args)
         .stdin(std::process::Stdio::inherit())
