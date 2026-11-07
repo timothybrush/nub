@@ -47,6 +47,8 @@ Ask for the run, then watch it. Both steps — the request is not optional, and 
 
 ```bash
 gh pr edit <N> --add-label ci      # requests CI against the current head; the label is removed again immediately
+                                   # use ci-full for resolution, the linker, the launcher's payload format, a shared type,
+                                   # or a change to a workflow only ci-full runs
 nub scripts/ci-watch.ts --pr <N> --required "CI gate" --timeout 90
 ```
 
@@ -81,7 +83,6 @@ The `Main` ruleset blocks `update` on `main`, so a plain merge fails with `the b
 ```bash
 gh pr merge <N> --squash --admin
 git -C <shared-tree> fetch origin && git -C <shared-tree> merge --ff-only origin/main  # never pull --ff-only
-make install-dev                                                                       # skip only if the diff was docs-only
 git push origin --delete <branch> && git branch -D <branch>
 git worktree remove <dir> --force
 ```

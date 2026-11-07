@@ -38,7 +38,8 @@
 //!   row records the *floor* and *intent*, not the path.
 //! - **`Polyfill { runtime_file, global }`** — no Node version ships it (or the
 //!   floor doesn't), so nub installs a JS polyfill from `runtime/<file>`, gated
-//!   at runtime by a `typeof <global>` feature-detect. The matrix records the
+//!   at runtime by a `typeof <global>` feature-detect (`"key" in owner` for an
+//!   accessor, whose getter throws on its prototype). The matrix records the
 //!   intent + the floor; it does **not** version-gate the polyfill in Rust (the
 //!   polyfill bows out on its own when the global is already present). A unit
 //!   test asserts each named file exists and contains the named feature-detect.
@@ -769,33 +770,91 @@ static FEATURES: &[Feature] = &[
         ],
         evidence: "Stage 4 (iterator-sequencing); native on Node 26+",
     },
-    // joint-iteration is the ITERATOR twin of Promise.allKeyed -- the await-dictionary
-    // proposal explicitly follows its shape. Stage 4 yet shipped by no engine.
     Feature {
         name: "Iterator.zip",
-        mitigations: &[(
-            band((18, 19, 0), None),
-            Mitigation::Polyfill {
-                runtime_file: "polyfills.cjs",
-                global: "Iterator.zip",
-            },
-        )],
-        evidence: "Stage 4 (joint-iteration); absent on every Node through 26.5",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.zip",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (joint-iteration); native in Node 27 Alpha (V8 15.6)",
     },
     Feature {
         name: "Iterator.zipKeyed",
-        mitigations: &[(
-            band((18, 19, 0), None),
-            Mitigation::Polyfill {
-                runtime_file: "polyfills.cjs",
-                global: "Iterator.zipKeyed",
-            },
-        )],
-        evidence: "Stage 4 (joint-iteration); absent on every Node through 26.5",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.zipKeyed",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (joint-iteration); native in Node 27 Alpha (V8 15.6)",
     },
-    // Anchor for the Stage 4 prototype additions: chunks/windows (iterator-chunking),
-    // includes (iterator-includes) and join (iterator-join). These install even where
-    // the ES2025 helpers above are already native.
+    Feature {
+        name: "Iterator.includes",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.prototype.includes",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "iterator-includes; native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Iterator.join",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Iterator.prototype.join",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "iterator-join; native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Intl.Locale.variants",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Intl.Locale.prototype.variants",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Intl.Locale variants accessor; native in Node 27 Alpha (V8 15.6)",
+    },
+    Feature {
+        name: "Math.sumPrecise",
+        mitigations: &[
+            (
+                band((18, 19, 0), Some((27, 0, 0))),
+                Mitigation::Polyfill {
+                    runtime_file: "polyfills.cjs",
+                    global: "Math.sumPrecise",
+                },
+            ),
+            (band((27, 0, 0), None), Mitigation::Native),
+        ],
+        evidence: "Stage 4 (proposal-math-sum); native in Node 27 Alpha (V8 15.6)",
+    },
+    // chunks/windows are separate from the includes/join methods native in 27.
     Feature {
         name: "Iterator.chunks",
         mitigations: &[(
@@ -805,18 +864,7 @@ static FEATURES: &[Feature] = &[
                 global: "Iterator.prototype.chunks",
             },
         )],
-        evidence: "Stage 4 (iterator-chunking/includes/join, 2026-09); absent on every Node through 26.10 (V8 14.6)",
-    },
-    Feature {
-        name: "Math.sumPrecise",
-        mitigations: &[(
-            band((18, 19, 0), None),
-            Mitigation::Polyfill {
-                runtime_file: "polyfills.cjs",
-                global: "Math.sumPrecise",
-            },
-        )],
-        evidence: "Stage 3 (proposal-math-sum); absent on every Node through 26.5 (bun ships it)",
+        evidence: "Stage 4 (iterator-chunking); absent in Node 27 Alpha (V8 15.6)",
     },
     // JSON.parse exists everywhere, so this anchor's runtime detect probes the
     // options behavior rather than the global's presence.
@@ -1119,9 +1167,10 @@ static FEATURES: &[Feature] = &[
         evidence: "TC39 Stage 4; native on Node 26+ (typeof probe on 25.9.0 vs 26.0.0); lazy global (A37)",
     },
     // ── Worker (browser-shape global) ───────────────────────────────────────
-    // The browser-shape `Worker` global is not shipped by any Node version (Node
-    // has `node:worker_threads.Worker`, not the browser global), so nub polyfills
-    // it across the floor, wrapping `worker_threads.Worker` with EventTarget.
+    // Node's own browser-shape `Worker` global exists only behind
+    // `--experimental-web-worker` (26.9+), which nub does not inject, so nub polyfills
+    // it across the floor, wrapping `worker_threads.Worker` with EventTarget. With
+    // that flag set, the polyfill finds a constructor already there and stands aside.
     Feature {
         name: "Worker",
         mitigations: &[(
@@ -1131,7 +1180,7 @@ static FEATURES: &[Feature] = &[
                 global: "globalThis.Worker",
             },
         )],
-        evidence: "browser-shape Worker not in any Node; wraps node:worker_threads",
+        evidence: "browser-shape Worker only behind --experimental-web-worker (26.9+); wraps node:worker_threads",
     },
     // ── navigator global ────────────────────────────────────────────────────
     // The `navigator` object (hardwareConcurrency / userAgent / language / languages
@@ -1386,8 +1435,14 @@ mod tests {
                         )
                     });
                     let needle = format!("typeof {global}");
+                    // Accessor guards must not read the getter on its prototype:
+                    // Intl.Locale accessors require a branded instance.
+                    let property_guard = global
+                        .rsplit_once('.')
+                        .map(|(owner, key)| format!("\"{key}\" in {owner}"));
                     assert!(
-                        src.contains(&needle),
+                        src.contains(&needle)
+                            || property_guard.is_some_and(|guard| src.contains(&guard)),
                         "feature {:?}: {} does not contain feature-detect {:?}",
                         f.name,
                         runtime_file,

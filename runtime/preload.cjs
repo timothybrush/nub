@@ -222,6 +222,7 @@ if (hasRegisterHooks && !requireEsmDisabled && !forceAsyncTier) {
   // not leaked onto the user's stderr — on every entry above nub is forced onto
   // module.register (require(esm) off, foreign-loader composition, or registerHooks
   // absent outright), so the user has no action to take. See registerLoaderWorker.
+  common.installAsyncTierCjsSource();
   common.registerLoaderWorker(
     "./preload-async-hooks.mjs",
     pathToFileURL(__filename).href,
@@ -382,7 +383,10 @@ function installLazyEsmPolyfills() {
   // which happens before the first `new Worker`, so it cannot wait for the lazy
   // Worker load below. See runtime/worker-blob-url.cjs.
   try {
-    __require("./worker-blob-url.cjs").installBlobUrlSupport();
+    // Native Web Workers read Blob contents themselves; capture only for our shim.
+    if (typeof globalThis.Worker === "undefined") {
+      __require("./worker-blob-url.cjs").installBlobUrlSupport();
+    }
   } catch {
     // blob: worker support is best-effort; never block startup on it.
   }
