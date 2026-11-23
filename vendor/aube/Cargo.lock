@@ -238,6 +238,7 @@ dependencies = [
  "aube-resolver",
  "aube-runtime",
  "aube-scripts",
+ "aube-semver",
  "aube-settings",
  "aube-store",
  "aube-util",
@@ -344,6 +345,7 @@ version = "2.2.9"
 dependencies = [
  "aube-codes",
  "aube-manifest",
+ "aube-semver",
  "aube-settings",
  "aube-util",
  "aube-workspace",
@@ -440,6 +442,7 @@ dependencies = [
  "aube-lockfile",
  "aube-manifest",
  "aube-registry",
+ "aube-semver",
  "aube-store",
  "aube-util",
  "base64 0.23.1",
@@ -468,6 +471,7 @@ version = "2.2.9"
 dependencies = [
  "aube-codes",
  "aube-manifest",
+ "aube-semver",
  "aube-util",
  "base64 0.23.1",
  "flate2",
@@ -504,6 +508,14 @@ dependencies = [
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "aube-semver"
+version = "2.2.9"
+dependencies = [
+ "node-semver",
+ "regex",
 ]
 
 [[package]]

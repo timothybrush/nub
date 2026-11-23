@@ -105,7 +105,7 @@ fn engine_pin(
     let version = entry
         .get("version")
         .and_then(Value::as_str)
-        .filter(|v| node_semver::Range::parse(v).is_ok())
+        .filter(|v| npm_range(v).is_some())
         .map(str::to_string);
     let on_fail = entry
         .get("onFail")
@@ -146,14 +146,16 @@ fn engine_packages(version: &node_semver::Version) -> &'static [&'static str] {
     }
 }
 
+/// A pin's range as npm's `semver` reads it, which is how pnpm reads it. A
+/// comma, which npm's grammar lacks, makes it no range, as it is to pnpm.
+/// nub-core's `PmRange` reads a range through the same crate, so the version
+/// a range launches and the version recorded here agree.
+fn npm_range(spec: &str) -> Option<aube_semver::Range> {
+    aube_semver::Range::parse(spec)
+}
+
 fn satisfies(version: &str, range: &str) -> bool {
-    match (
-        node_semver::Version::parse(version),
-        node_semver::Range::parse(range),
-    ) {
-        (Ok(v), Ok(r)) => r.satisfies(&v),
-        _ => false,
-    }
+    aube_semver::satisfies(version, range)
 }
 
 /// What the env document needs, decided without the network.
@@ -174,30 +176,36 @@ fn read_manifest(dir: &Path) -> Option<Value> {
     serde_json::from_str(&raw).ok()
 }
 
-fn plan(manifest: &Value, existing: Option<&EnvLockfile>) -> Plan {
+fn plan(manifest: &Value, existing: Option<&EnvLockfile>, target: Option<&str>) -> Plan {
     let Some(wanted) = wanted_pnpm(manifest) else {
         return Plan::Current;
     };
+    // `nub pm update` names the version to record, which replaces a recorded
+    // one the range still allows; it is the only caller that moves a range pin.
+    let target = target
+        .filter(|v| satisfies(v, &wanted.specifier))
+        .map(str::to_string);
     // A recorded version the pin still allows is kept, so a range pin does
     // not move whenever a newer pnpm is published.
-    let locked = existing.and_then(|env| {
-        let version = env
-            .package_manager_dependencies()?
-            .get("pnpm")?
-            .version
-            .clone();
-        let parsed = node_semver::Version::parse(&version).ok()?;
-        (satisfies(&version, &wanted.specifier)
-            && env.pins(&version, engine_packages(&parsed), None))
-        .then_some(version)
+    let locked = target.or_else(|| {
+        existing.and_then(|env| {
+            let version = env
+                .package_manager_dependencies()?
+                .get("pnpm")?
+                .version
+                .clone();
+            let parsed = node_semver::Version::parse(&version).ok()?;
+            (satisfies(&version, &wanted.specifier)
+                && env.pins(&version, engine_packages(&parsed), None))
+            .then_some(version)
+        })
     });
     let Some(version) = locked.or_else(|| offline_version(&wanted)) else {
         // A range below pnpm 11 records nothing whichever release it picks.
-        let records = node_semver::Range::parse(">=11.0.0-0").ok();
-        let below_11 = node_semver::Range::parse(&wanted.specifier)
-            .ok()
+        let records = aube_semver::parse_range(">=11.0.0-0").ok();
+        let below_11 = npm_range(&wanted.specifier)
             .zip(records)
-            .is_some_and(|(range, records)| !range.allows_any(&records));
+            .is_some_and(|(range, records)| !range.overlaps(&records));
         return if below_11 {
             Plan::Current
         } else {
@@ -256,7 +264,7 @@ pub fn env_document_is_current(lockfile_dir: &Path) -> bool {
         .ok()
         .flatten()
         .and_then(|text| EnvLockfile::parse(&text));
-    matches!(plan(&manifest, env.as_ref()), Plan::Current)
+    matches!(plan(&manifest, env.as_ref(), None), Plan::Current)
 }
 
 /// Bring the env document of `<lockfile_dir>/pnpm-lock.yaml` in line with
@@ -272,15 +280,28 @@ pub async fn sync_pnpm_env_lockfile(
     lockfile_dir: &Path,
     network_mode: aube_registry::NetworkMode,
 ) -> miette::Result<Option<String>> {
+    record_pnpm_env_lockfile(lockfile_dir, None, network_mode).await
+}
+
+/// [`sync_pnpm_env_lockfile`], recording `target` when the pin allows it
+/// rather than keeping a recorded version, and creating the lockfile when
+/// there is none. A `target` the pin does not allow is ignored.
+pub async fn record_pnpm_env_lockfile(
+    lockfile_dir: &Path,
+    target: Option<&str>,
+    network_mode: aube_registry::NetworkMode,
+) -> miette::Result<Option<String>> {
     let lockfile_path = lockfile_dir.join(LOCKFILE);
-    let Ok(content) = std::fs::read_to_string(&lockfile_path) else {
+    // With a target and no lockfile, write what pnpm's own first command
+    // writes there: the env document alone.
+    let Some(content) = read_lockfile(&lockfile_path, target.is_some())? else {
         return Ok(None);
     };
     let Some(manifest) = read_manifest(lockfile_dir) else {
         return Ok(None);
     };
     let existing = EnvLockfile::from_lockfile_content(&content);
-    let (wanted, version) = match plan(&manifest, existing.as_ref()) {
+    let (wanted, version) = match plan(&manifest, existing.as_ref(), target) {
         Plan::Current => return Ok(None),
         Plan::Record {
             wanted,
@@ -340,6 +361,20 @@ pub async fn sync_pnpm_env_lockfile(
         .into_diagnostic()
         .wrap_err_with(|| format!("write {}", lockfile_path.display()))?;
     Ok(Some(version))
+}
+
+/// The lockfile's text; with `create`, an empty one when the file is missing.
+/// Only a missing file counts as no lockfile: any other read failure is an
+/// error, because writing over a file that could not be read would erase its
+/// project document.
+fn read_lockfile(path: &Path, create: bool) -> miette::Result<Option<String>> {
+    match std::fs::read_to_string(path) {
+        Ok(content) => Ok(Some(content)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(create.then(String::new)),
+        Err(e) => Err(e)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("read {}", path.display())),
+    }
 }
 
 /// The version a pin with nothing recorded resolves to offline: the
@@ -427,6 +462,21 @@ mod tests {
         wanted_pnpm(&manifest).map(|w| (w.specifier, w.on_fail_download, w.legacy_exact))
     }
 
+    /// Only a range no pnpm 11 can satisfy records nothing. The check is on
+    /// bounds: npm's `intersects` would call `11.1.0-rc.1` disjoint from
+    /// `>=11.0.0-0`, though pnpm 11.1.0-rc.1 records its pin.
+    #[test]
+    fn a_range_reaching_pnpm_11_plans_a_record() {
+        let plans_record = |range: &str| {
+            let manifest = json!({ "devEngines": { "packageManager":
+                { "name": "pnpm", "version": range, "onFail": "download" } } });
+            matches!(plan(&manifest, None, None), Plan::Record { .. })
+        };
+        assert!(plans_record("^10.0.0 || 11.1.0-rc.1"));
+        assert!(plans_record("^11.0.0"));
+        assert!(!plans_record("^10.0.0"));
+    }
+
     #[test]
     fn dev_engines_pin_persists_unless_on_fail_is_ignore() {
         let pin = |on_fail: Value| {
@@ -453,6 +503,121 @@ mod tests {
         );
         assert_eq!(
             array(json!([{ "name": "pnpm", "version": "11.28.9" }, { "name": "npm" }])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_target_moves_a_range_pin_that_the_lockfile_already_satisfies() {
+        let manifest = json!({ "devEngines": { "packageManager":
+            { "name": "pnpm", "version": "^11.20.0", "onFail": "warn" } } });
+        let entry = |name: &str| {
+            format!("      '{name}':\n        specifier: 11.20.0\n        version: 11.20.0\n")
+        };
+        let record = |name: &str| {
+            format!("  '{name}@11.20.0':\n    resolution: {{integrity: sha512-AAAA}}\n\n")
+        };
+        let snapshot = |name: &str| format!("  '{name}@11.20.0': {{}}\n\n");
+        let env = format!(
+            "---\nlockfileVersion: '9.0'\n\nimporters:\n\n  .:\n    packageManagerDependencies:\n{}{}\npackages:\n\n{}{}snapshots:\n\n{}{}---\n",
+            entry("@pnpm/exe"),
+            entry("pnpm"),
+            record("@pnpm/exe"),
+            record("pnpm"),
+            snapshot("@pnpm/exe"),
+            snapshot("pnpm"),
+        );
+        let existing = EnvLockfile::from_lockfile_content(&env).expect("env document");
+        let recorded = |target| match plan(&manifest, Some(&existing), target) {
+            Plan::Current => None,
+            Plan::Record { version, .. } => Some(version),
+        };
+        assert_eq!(recorded(None), None, "a satisfying record is kept");
+        assert_eq!(recorded(Some("11.29.0")), Some(Some("11.29.0".to_string())));
+        assert_eq!(recorded(Some("11.20.0")), None, "already recorded");
+        assert_eq!(
+            recorded(Some("12.0.0")),
+            None,
+            "a target outside the range is ignored"
+        );
+    }
+
+    /// A lockfile that exists but can't be read is an error, never an absent
+    /// lockfile to create: replacing it would erase its project document.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn only_a_missing_lockfile_is_created() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{ "devEngines": { "packageManager": { "name": "pnpm", "version": "^11.20.0", "onFail": "warn" } } }"#,
+        )
+        .unwrap();
+        let lockfile = dir.path().join(LOCKFILE);
+        let bytes = b"lockfileVersion: '9.0'\n\nimporters:\n\n  .: {}\n";
+        std::fs::write(&lockfile, bytes).unwrap();
+        std::fs::set_permissions(&lockfile, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&lockfile).is_ok() {
+            return; // running as root: the file stays readable
+        }
+        let read = read_lockfile(&lockfile, true);
+        let result = record_pnpm_env_lockfile(
+            dir.path(),
+            Some("11.29.0"),
+            aube_registry::NetworkMode::Offline,
+        )
+        .await;
+        std::fs::set_permissions(&lockfile, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read.is_err(), "an unreadable lockfile is not a missing one");
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&lockfile).unwrap(), bytes);
+        // Only a missing file reads as no lockfile, and only then is one created.
+        let missing = dir.path().join("missing.yaml");
+        assert_eq!(read_lockfile(&missing, true).unwrap().as_deref(), Some(""));
+        assert_eq!(read_lockfile(&missing, false).unwrap(), None);
+        assert_eq!(
+            read_lockfile(&lockfile, true)
+                .unwrap()
+                .as_deref()
+                .map(str::as_bytes),
+            Some(&bytes[..])
+        );
+    }
+
+    /// Verdicts from npm's `semver` 7.8.6, which pnpm reads ranges with.
+    #[test]
+    fn pin_ranges_match_npm_semver() {
+        assert!(satisfies("11.29.0", ">=9 <=11"));
+        assert!(!satisfies("12.0.0", ">=9 <=11"));
+        assert!(satisfies("11.2.9", "<=11.2"));
+        assert!(!satisfies("11.3.0", "<=11.2.x"));
+        assert!(satisfies("11.29.5", "11.20.0 - 11.29"));
+        assert!(satisfies("12.23.0", "^11.20.0 || ^12.0.0"));
+        // npm rejects a comma, so pnpm records nothing for such a pin.
+        assert!(!satisfies("11.29.0", ">=11.25.0, <12.0.0"));
+        // npm reads a set whose comparators cannot all hold as empty.
+        assert!(satisfies("11.15.0", ">=11.29.0 <=11.20.* || 11.15.0"));
+        assert!(!satisfies("11.20.0", ">=11.29.0 <=11.20.* || 11.15.0"));
+        assert!(!satisfies("11.29.0", ">=11.29.0 <=11.20.0"));
+        // A range npm rejects pins nothing; no part's arithmetic overflows.
+        for spec in [
+            "<=11.029",
+            "1.02.3",
+            "<=18446744073709551615",
+            "<=9007199254740991",
+        ] {
+            assert!(!satisfies("11.29.0", spec), "{spec}");
+            assert_eq!(
+                wanted(json!({ "devEngines": { "packageManager":
+                    { "name": "pnpm", "version": spec } } })),
+                None,
+                "{spec}"
+            );
+        }
+        assert_eq!(
+            wanted(json!({ "devEngines": { "packageManager":
+                { "name": "pnpm", "version": ">=11.25.0, <12.0.0" } } })),
             None
         );
     }
